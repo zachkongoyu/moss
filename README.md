@@ -128,6 +128,74 @@ graph TD
 
 - **Duration & expiry**: Sessions are kept live to preserve context up to a 30-minute idle timeout. If a session is idle for more than 30 minutes it is cleared from the Blackboard (L3) and subsequent interactions start a fresh session.
 
+## 🚧 Gap Lifecycle
+
+- **One-directional progression**: Blocked → Ready → Assigned → Closed.
+- **Blocked**: The gap is waiting on one or more dependencies (other gaps). If a gap has no dependencies, it is auto-unblocked and becomes `Ready` immediately.
+- **Ready**: Eligible to be polled by the scheduler / JoinSet for assignment to a Pulse.
+- **Assigned**: A Pulse (Network or Machine) has claimed the gap and is actively processing it. Progress updates can post Evidence and may spawn new gaps.
+- **Closed**: Terminal state; the gap is resolved (successful or terminally failed).
+
+```mermaid
+graph LR
+    Blocked --> Ready
+    Ready --> Assigned
+    Assigned --> Closed
+```
+
+Notes:
+- A gap enters `Blocked` when it depends on one or more other gaps. Dependency tracking is managed by the scheduler or an external reconciler; when dependencies are cleared the scheduler should auto-transition the gap to `Ready`.
+- Retries, cancellations, or failure handling are implementation details handled at the Pulse level; the core lifecycle is intentionally simple and linear.
+
+## 🧠 Blackboard Data Structure (Rust)
+
+Below are minimal Rust types for `Gap`, `Evidence` and the `Blackboard` matching the requested simplification. The snippet omits imports and visibility modifiers for brevity.
+
+```rust
+enum GapState {
+    Blocked,
+    Ready,
+    Assigned,
+    Closed,
+}
+
+enum Pulse {
+    Network,
+    Machine,
+    Other(String),
+}
+
+struct Gap {
+    gap_id: String,
+    state: GapState,
+    description: String,
+    pulse: Pulse,
+}
+
+struct Evidence {
+    gap_id: String,
+    content: Value,
+    done: bool,
+}
+
+struct Blackboard {
+    intent: Option<String>,
+    // evidences: map from gap id -> Evidence
+    evidences: DashMap<String, Evidence>,
+    gaps: DashMap<String, Gap>,
+    gates: DashMap<String, Value>,
+}
+```
+
+Implementation notes:
+- Use `DashMap` for concurrent reads/writes from Pulses and the Synthesizer.
+- Dependency tracking is external to `Gap` (the scheduler or reconciler must track dependencies and auto-unblock gaps when cleared).
+- Persist only durable artifacts (post-crystallization) to L2 (Qdrant); keep the Blackboard as L3 per-session ephemeral context.
+
+Evidence definition: small JSON-serializable records produced by Pulses or the Synthesizer and stored in the Blackboard's `evidences` map keyed by `gap_id` (see snippet above).
+
+- Pulses append or update evidence entries for a gap; evidence is used by the Synthesizer and scheduler to resolve dependencies or synthesize responses.
+
 ## 🧪 Baseline Test Scenarios
 
 ### 🕹️ Level 1: Basic Reflex
