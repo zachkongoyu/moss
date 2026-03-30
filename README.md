@@ -8,7 +8,10 @@ It transforms personal computing into a proactive, collaborative intelligence pa
 - **The Fresh Start**: Every session clears the Blackboard (L3) to ensure reasoning is never cluttered by irrelevant history.
 - **Logits-based Snapshotting**: Saves mathematical "thought states" into a Thin Active Cache (L1), allowing for sub-10ms resume latency via load_context syscalls.
 - **Knowledge Crystallization**: Post-mission, the Meta-Agent compresses outcomes into Durable Artifacts stored in a Vector DB (L2).
-- **Bio-Inspired Performance**: Achieves a 2.1x increase in execution speed by bypassing the von Neumann bottleneck through Heterogeneous Computing (RTX 4090/NPU).
+- **Bio-Inspired Performance**: Achieves a 2.1x increase in execution speed by bypassing the von Neumann bottleneck through unified high-density inference on RTX 4090 Tensor Cores.
+- **Session-aware Evidence Injection**: The Synthesizer can inject relevant session context into the Blackboard's evidence stream to preserve continuity during a session. Sessions persist while active and are subject to an idle timeout (see Session lifecycle below).
+
+- **Relevance Gate (Yes/No)**: Before injection, the Synthesizer can optionally run a quick relevance check (yes/no). If the session context is not relevant to the new query, the gate returns `No` and the Blackboard remains unaffected.
 
 ## 🗺️ Development Roadmap: The Genesis Loop
 
@@ -24,90 +27,106 @@ It transforms personal computing into a proactive, collaborative intelligence pa
 
 ```mermaid
 graph TD
-    subgraph L5_Interface [L5: Human-OS Interface]
-        User((User)) <--> CLI[Rust Daemon: Terminal / HUD]
-        CLI -.->|Real-time Streaming| Telemetry[Born Observable: Progress Logs]
-    end
-
-    subgraph L4_Orchestration [L4: Meta-Orchestration Layer]
-        direction TB
-        MetaAgent[Meta-Agent: Synthesizer]
-        GoalAnalytic[Intent Decomposition & Gap Identification]
-        HITL[HITL Gate: interrupt syscall for Approval]
-        
-        MetaAgent --- GoalAnalytic
-        GoalAnalytic -.-> HITL
-    end
-
-    subgraph L3_Context [L3: Semantic Context - The Blackboard]
-        direction TB
-        State[(JSON State: Intent + Evidence)]
-        Gaps{Active Gaps Queue}
-        PulseStatus[Thread-Bound Agent Status Table]
-        State --- Gaps --- PulseStatus
-    end
-
-    subgraph L2_Agent_Workforce [L2: Expert Agents - Thread Bound]
+    %% Layout groups
+    subgraph L5_Interface [L5: Interface]
         direction LR
-        NetworkPulse[Network Agent: Web/Browsing]
-        MachinePulse[Machine Agent: Local Syscalls]
-        AgentsMD[Agents.md: Boot Instructions & Safety Walls]
-        
-        NetworkPulse --- AgentsMD
-        MachinePulse --- AgentsMD
+        User((User))
+        CLI[Rust Daemon: CLI / HUD]
+        HUD[HUD: Blackboard Delta Streamer]
     end
 
-    subgraph L2_Execution [L2.5: Capability & Security Bridge]
+    subgraph L4_Orchestration [L4: Brain - Synthesizer]
         direction TB
-        MCP[MCP Bridge: Tool & API Integration]
-        DefenseClaw[DefenseClaw: Pre-execution Runtime Scanning]
-        
-        NetworkPulse --> MCP
-        MachinePulse --> DefenseClaw
+        Brain[Synthesizer: Reasoning Core]
     end
 
-    subgraph L1_Living_Memory [L1: Living Memory Hierarchy]
+    subgraph L3_Scratchpad [L3: Context - Blackboard]
         direction TB
-        ThinCache[L1 Thin Cache: KV-cache Logits / Reasoning Snapshots]
-        Crystallization[Knowledge Crystallization Process]
-        DurableStore[(L2 Durable Store: Crystallized Artifacts)]
-        VectorDB[ChromaDB: Semantic Indexing]
-        
-        ThinCache -.->|LRU-K Eviction| Crystallization
-        Crystallization --> DurableStore
-        DurableStore --- VectorDB
+        subgraph DashMaps [DashMap Memory - Per Query]
+            Intent[intent]
+            Gaps[gaps: Work DAG]
+            Evidence[evidence: Structured Data]
+            Gates[gates: HITL Callbacks]
+            Relevance{"Use session context? (Yes / No)"}
+        end
     end
 
-    subgraph L0_Hardware [L0: Hardware - Data Sovereignty]
-        RTX4090[NVIDIA RTX 4090: vLLM Inference Core]
-        NPU[Local NPU: Edge Guardian & Latency Reduction]
-        RTX4090 --- NPU
+    subgraph L2_Workforce [L2: Hands - Stateless Pulses]
+        direction TB
+        JoinSet{tokio::JoinSet}
+        NPulse[Network Pulse]
+        MPulse[Machine Pulse]
     end
 
-    %% --- Key Flow Logic ---
-    CLI -->|Intent| MetaAgent
+    subgraph L1_Memory_Tier [L1: Living Memory Hierarchy]
+        direction TB
+        M1["Session Context: Ring Buffer (30m idle timeout)"]
+        M2[Sled DB: Local Prefs & Audit]
+        M3[Qdrant: Knowledge Crystals]
+    end
 
-    %% The "Load Context" Feedback Loop
-    MetaAgent -->|1a. snapshot_context| ThinCache
-    ThinCache -->|1b. load_context| MetaAgent
+    subgraph L0_Infra [L0-L2.5: Infrastructure & Execution]
+        direction TB
+        LLM[LLM Core: Local RTX 4090 / Remote API]
+        MCP[MCP Bridge: Tool / App Integration]
+        Defense[DefenseClaw: Pre-Execution Scanner]
+    end
 
-    %% History & Initialization
-    MetaAgent -->|2. Semantic Retrieval| VectorDB
-    VectorDB -->|3. Populate context| State
-    
-    %% Parallel Execution
-    MetaAgent -->|4. Identify Gaps| Gaps
-    Gaps -->|5. Parallel Dispatch| NetworkPulse
-    Gaps -->|5. Parallel Dispatch| MachinePulse
-    
-    NetworkPulse -->|6. Post Evidence| State
-    MachinePulse -->|7. Post Evidence| State
-    
-    %% Crystallization & Reboot
-    State -->|8. Task Done / Zero Gaps| Crystallization
-    Crystallization -->|9. Save & Summarize| DurableStore
-    DurableStore -->|10. Fresh Start| MetaAgent
+    %% --- CONNECTIONS ---
+    CLI -->|Intent| Brain
+    M3 -.->|Semantic Retrieval| Brain
+    M1 -.->|load_context| Brain
+
+    Brain -->|Initialize DAG| Gaps
+    Brain -->|Check relevance| Relevance
+    Relevance -->|Yes| Evidence
+    Relevance -->|No| Gaps
+
+    Gaps -->|Poll Ready Tasks| JoinSet
+    JoinSet --> NPulse & MPulse
+    NPulse & MPulse -.->|Update Progress/Deps| Gaps
+
+    NPulse -->|Request Tool Use| MCP
+    MPulse -->|Code Execution| Defense
+    NPulse & MPulse -->|Logical Inference| LLM
+
+    LLM & MCP & Defense -->|Post Result| Evidence
+    Evidence -.->|Resolve Dependencies| Gaps
+
+    Gaps --"Stream"--> HUD
+    Evidence --"Stream"--> HUD
+
+    Gaps -->|Terminal Node Met| Brain
+    M1 -.->|idle > 30m: expire session| Brain
+    Brain -->|Response Synthesis| CLI
+    DashMaps -->|Crystallization| M3
+
+    %% Styling
+    classDef interface fill:#EEF2FF,stroke:#2563EB,stroke-width:2px,color:#0f172a;
+    classDef brain fill:#FEF3C7,stroke:#D97706,stroke-width:2px,color:#0f172a;
+    classDef scratch fill:#ECFCCB,stroke:#16A34A,stroke-width:2px,color:#064E3B;
+    classDef workforce fill:#F0F9FF,stroke:#0EA5E9,stroke-width:2px,color:#0B3A4B;
+    classDef memory fill:#FCE7F3,stroke:#DB2777,stroke-width:2px,color:#4C0033;
+    classDef infra fill:#F8FAF9,stroke:#64748B,stroke-width:2px,color:#0F172A;
+    classDef gate fill:#FFF7ED,stroke:#EA580C,stroke-width:2px,color:#92400E;
+
+    class User,CLI,HUD interface;
+    class Brain brain;
+    class Intent,Gaps,Evidence,Gates scratch;
+    class JoinSet,NPulse,MPulse workforce;
+    class M1,M2,M3 memory;
+    class LLM,MCP,Defense infra;
+    class Relevance gate;
+
+    linkStyle default stroke:#94A3B8,stroke-width:1.5px;
+    linkStyle 0 stroke:#60A5FA,stroke-width:2px;
+    %% Session context injection
+    Brain -->|Inject Session Context into Evidence| Evidence
 ```
+
+### Session lifecycle
+
+- **Duration & expiry**: Sessions are kept live to preserve context up to a 30-minute idle timeout. If a session is idle for more than 30 minutes it is cleared from the Blackboard (L3) and subsequent interactions start a fresh session.
 
 ## 🧪 Baseline Test Scenarios
 
@@ -132,4 +151,4 @@ graph TD
 - Reasoning Core: DeepSeek-V3.2-Exp / GLM-4.5-Air (Optimized for tool/web use).
 - Governance: DefenseClaw (Pre-execution runtime scanning).
 - Protocol: MCP (Model Context Protocol).
-- Hardware: NVIDIA RTX 4090 (vLLM core) + Local NPU (Edge Guardian).
+- Hardware: NVIDIA RTX 4090 (vLLM core, unified safety + reasoning pipeline).
