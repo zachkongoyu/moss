@@ -22,7 +22,7 @@ The system follows the **Blackboard architecture pattern** (Hearsay-II lineage):
 
 ### 1.1 Design Principles
 
-1. **Session-scoped reasoning.** Each session starts with a clean Blackboard. Reasoning is never cluttered by stale context from prior sessions.
+1. **Round-scoped reasoning.** A single session can spawn many Blackboards over its lifetime. Each conversation round starts with a fresh Blackboard; Moss creates it, manages its lifecycle, and crystallizes it when the Gap DAG reaches a terminal state. A closed Blackboard is never reopened — the next user turn always gets a new one. Prior outcomes are accessible via Knowledge Crystals (M3), not by reopening past Blackboards.
 2. **Code as the universal solver.** Every Gap is resolved by generating and executing code (a deterministic script or a reactive agent loop), not by prompting the LLM to "think harder."
 3. **Failure containment.** A failing Gap does not corrupt the global Blackboard. Reactive tasks run inside encapsulated Micro-Agent instances running an isolated ReAct loop.
 4. **Concurrency by default.** Independent Gaps execute in parallel via `tokio::JoinSet`. The DAG structure — not a global lock — determines ordering.
@@ -35,7 +35,7 @@ The system follows the **Blackboard architecture pattern** (Hearsay-II lineage):
 ```
 L5  Interface          CLI daemon, HUD delta streamer
 L4  Orchestrator       Intent decomposition, DAG management, response synthesis
-L3  Blackboard         Shared per-session state: Gaps, Evidence, Gates
+L3  Blackboard         Moss-managed task memory: Gaps, Evidence, Gates (lifecycle per conversation round)
 L2  Compiler/Executor  Gap-to-artifact compilation, sandboxed execution
 L1  Memory             Session ring buffer (M1), local DB (M2), vector store (M3)
 L0  Infrastructure     LLM providers, MCP bridge, DefenseClaw scanner
@@ -61,7 +61,7 @@ The strategic coordinator. Receives user intent, queries Memory for relevant con
 | Context injection (M1/M3 retrieval before planning) | `PLANNED` | — |
 
 **L3 — Blackboard** `PARTIAL`
-Per-session shared memory using `DashMap` for lock-free concurrent access. Holds the intent, the Gap DAG, accumulated Evidence, and human-in-the-loop Gates.
+Moss-managed task memory using `DashMap` for lock-free concurrent access. Holds the intent, the Gap DAG, accumulated Evidence, and human-in-the-loop Gates. A Blackboard is created by Moss at the start of a conversation round and lives until all Gaps reach a terminal state; it is then crystallized and archived. A single session can contain many sequential Blackboards. A closed Blackboard is never reopened.
 
 | Sub-component | Status | Notes |
 |---|---|---|
@@ -353,7 +353,7 @@ The Orchestrator sends the user query and serialized Blackboard state to the LLM
 
 ### 4.2 Blackboard `PARTIAL`
 
-**Responsibility:** Per-session shared memory. Holds the Gap DAG, Evidence map, and HITL Gates.
+**Responsibility:** Moss-managed task memory for one conversation round. Holds the Gap DAG, Evidence map, and HITL Gates. Moss creates a Blackboard when a new gap-resolution round begins, keeps it active through any multi-turn HITL interactions (Gated approvals), and crystallizes it when all Gaps are terminal. Closed Blackboards are immutable — never reopened; the next user turn creates a new Blackboard.
 
 **Current state:** Data structures and basic insert/mutate operations are implemented. Missing: dependency resolution, ready-gap polling, change notification, and serialization round-tripping.
 
@@ -698,39 +698,133 @@ impl DefenseClaw {
 
 ## 9. Session Lifecycle
 
+A **Session** is the lifetime of the running Moss process. A **Blackboard** is scoped to one conversation round — from when Moss begins processing a user's intent until all Gaps in the resulting DAG reach a terminal state. A single session can contain many sequential Blackboards. Moss controls the Blackboard lifecycle: it creates one at the start of each round, keeps it open for any multi-turn HITL interactions (Gated approvals), and crystallizes it once all Gaps are terminal. A closed Blackboard is never reopened.
+
 ```
-[User sends first message]
-        |
-        v
-  Create Session (new Uuid, new Blackboard, empty M1 buffer)
-        |
-        v
-  Run Orchestrator.run() --> produce response
-        |
-        v
-  Update M1 buffer with query + response summary
-        |
-        v
+[Moss starts]
+      |
+      v
+  Create Session (new Uuid, empty M1 buffer)
+      |
+      v
+  Wait for user input
+      |
+      v
+[USER TURN — Moss creates a new Blackboard (new Uuid)]
+      |
+      v
+  Retrieve M1 context + M3 crystals
+  Orchestrator.decompose() --> Gap DAG inserted into Blackboard
+      |
+      v
+  Runner.execute() drives Gaps (Blocked -> Ready -> Assigned -> ...)
+      |
+    +-+-----------------------------------+
+    |                                     |
+    v                                     v
+ All Gaps terminal                 Gated Gaps remain
+    |                              (user approval required)
+    |                                     |
+    |                         Surface Gates; await user input
+    |                                     |
+    |                              approve / reject
+    |                                     |
+    |                                     v
+    |                         Gap -> Ready (approve)
+    |                         Gap -> Closed/Failure (reject)
+    |                                     |
+    +<------------------------------------+  (resume Runner; loop until all Gaps terminal)
+    |
+    v
+  Orchestrator.synthesize() --> final response
+  Crystallize Blackboard -> M3    (Blackboard sealed; immutable)
+  Update M1 buffer with round summary
+  Return response to user
+      |
+      v
   Wait for next input
-        |
-    +---+---+
-    |       |
-    v       v
-  Input     Idle > 30 min
-  arrives   (checked on next input)
-    |       |
-    v       v
-  Same      Clear Blackboard, clear M1
-  session   Start new session
+      |
+    +-+------------+
+    |              |
+    v              v
+ New input      Idle > 30 min
+ arrives        (checked on next input)
+    |              |
+    v              v
+ Create new     Clear M1 buffer
+ Blackboard     Session ended
+ (back to
+  USER TURN)
 ```
 
-**Important:** The idle timeout is not enforced by a background timer. It is checked when the next user input arrives. If 30+ minutes have elapsed since the last interaction, the Blackboard and M1 buffer are cleared, and the input is treated as the start of a new session. This avoids unnecessary background tasks for what is fundamentally a single-user CLI application.
+**Key invariants:**
+- A Blackboard is created and closed within one conversation round. It is never reopened after crystallization.
+- The M1 session buffer persists across Blackboard boundaries within a session. It is cleared only on session expiry (idle timeout or explicit exit).
+- Gated interactions happen *within* a single Blackboard's lifetime — the Blackboard stays active while awaiting user approval. It is not closed and reopened.
+- A closed Blackboard is an immutable historical record. The next user input always creates a fresh Blackboard.
 
-**Crystallization** happens at session end: either when the user explicitly exits, or when an idle timeout triggers a new session. Only sessions with at least one Closed gap with successful Evidence are crystallized.
+**Crystallization** happens when a Blackboard closes: the Orchestrator compresses the round's outcomes into a Knowledge Crystal saved to M3. Only rounds with at least one Closed gap with `EvidenceStatus::Success` are crystallized. On idle timeout, any in-progress Blackboard is force-closed and crystallized before M1 is cleared.
+
+**Session expiry** is checked on the next user input. If 30+ minutes have elapsed since the last interaction, M1 is cleared and the new input starts a fresh session. No background timer is needed.
 
 ---
 
-## 10. Gap Lifecycle
+## 10. Blackboard Lifecycle
+
+A Blackboard is **not** tied to a session — it is tied to a single conversation **round**. One session contains many sequential Blackboards; each round creates one, drives it to completion, and seals it.
+
+### 10.1 Lifecycle States
+
+```
+Created ──> Active ──> Terminal ──> Crystallized (sealed, immutable)
+```
+
+| State | Description |
+|---|---|
+| **Created** | Moss instantiates a new `Blackboard` (fresh `Uuid`) at the start of a conversation round. Intent is set; Gap DAG is empty. |
+| **Active** | Gap DAG execution is underway. The Blackboard accepts writes: Gap state changes, Evidence appends, Gate insertions. A Blackboard can remain Active across multiple back-and-forth user interactions while Gated Gaps await approval. |
+| **Terminal** | Every Gap has reached a terminal state (`Closed`). No further Gap-level writes occur. Synthesis runs against this read-only snapshot. |
+| **Crystallized** | The Orchestrator has compressed the round's Evidence into a Knowledge Crystal and written it to M3. The Blackboard is sealed and immutable. It is never reopened. |
+
+### 10.2 Lifecycle Transitions
+
+**Created → Active:** `orchestrator.decompose()` inserts the first Gap. From this point the Runner drives execution.
+
+**Active → Active (HITL loop):** When `blackboard.all_gated_or_closed()` is `true` but `all_closed()` is `false`, the Blackboard stays Active. Moss surfaces pending Gates to the user, waits for `approve <name>` / `reject <name>`, updates the affected Gaps, and resumes the Runner. The Blackboard is **not** closed and **not** reopened — it was never closed.
+
+**Active → Terminal:** `blackboard.all_closed()` returns `true`. The Runner exits its loop and passes control to synthesis.
+
+**Terminal → Crystallized:** `memory.crystallize(&blackboard)` is called after synthesis. Only Blackboards with at least one `EvidenceStatus::Success` Gap produce a Crystal in M3. Either way, the Blackboard is sealed immediately after this call and may not be written again.
+
+### 10.3 Ownership and Creation
+
+Moss — via `main.rs` or a future `MossKernel` struct — is the sole owner of the Blackboard lifecycle. The Orchestrator and Runner receive `Arc<Blackboard>` and may read/write, but they never create or seal one. Creation and sealing are the kernel's responsibility.
+
+```rust
+// Pseudocode — per-round logic in MossKernel
+let blackboard = Arc::new(Blackboard::new(intent));     // Created
+
+// Active (may loop for HITL interactions):
+let plan = orchestrator.decompose(query, &ctx, &crystals, &blackboard).await?;
+runner.execute(plan, blackboard.clone()).await?;         // Terminal on return
+
+// Terminal:
+let response = orchestrator.synthesize(&blackboard).await?;
+memory.crystallize(&blackboard).await?;                 // Crystallized (sealed)
+drop(blackboard);                                       // Arc ref-count → 0
+```
+
+### 10.4 Invariants
+
+- A Blackboard is created and destroyed within one conversation round. A session can contain many sequential Blackboards.
+- A Crystallized Blackboard is immutable. No code path reopens it.
+- The next user input always creates a **fresh** Blackboard. There is no `reopen` or `resume` API.
+- The M1 session buffer (`SessionBuffer`) is **separate** from the Blackboard. M1 persists across Blackboard boundaries within a session; it is cleared only on session expiry.
+- On idle timeout, any in-progress Blackboard is force-sealed (Terminal → Crystallized) before M1 is cleared.
+
+---
+
+## 11. Gap Lifecycle
 
 ```
 Blocked ──> Ready ──> Assigned ──> Gated ──> Ready  (on user approval)
@@ -755,7 +849,7 @@ This is a one-directional state machine. The only backward arc is `Gated → Rea
 
 ---
 
-## 11. Error Handling Strategy `PLANNED`
+## 12. Error Handling Strategy `PLANNED`
 
 The current codebase uses `.expect()` and `panic!()` pervasively. For a daemon process, panics are fatal. The error handling strategy going forward:
 
@@ -802,7 +896,7 @@ pub enum MossError {
 
 ---
 
-## 12. Architecture Decisions
+## 13. Architecture Decisions
 
 ### ADR-001: Blackboard Pattern over Message-Passing Agents
 
@@ -866,7 +960,7 @@ pub enum MossError {
 
 ---
 
-## 13. Open Questions
+## 14. Open Questions
 
 These are unresolved design decisions that need answers before or during implementation.
 
@@ -882,7 +976,7 @@ These are unresolved design decisions that need answers before or during impleme
 
 ---
 
-## 14. Implementation Status Matrix
+## 15. Implementation Status Matrix
 
 | Component | Layer | Status | Blocking dependencies |
 |---|---|---|---|
