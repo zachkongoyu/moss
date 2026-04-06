@@ -78,11 +78,10 @@
   - `RUST_LOG=moss=info` — pipeline flow (intent, gap open/close)
   - `RUST_LOG=moss=debug` — + evidence + full blackboard state each round
   - `RUST_LOG=moss=trace` — + gap detail before compile + blackboard after each execution
-- **Known issue:** Blackboard is created once in `Moss::new()` and shared across all `run()` calls. Gaps accumulate across queries. Fix in next item.
 
 ---
 
-### Blackboard Lifecycle Fix 🔜
+### Blackboard Lifecycle Fix ✅
 *Small fix, high priority — must land before Phase 6.*
 
 - Move `Arc<Blackboard>` creation into `Moss::run()` (fresh per query).
