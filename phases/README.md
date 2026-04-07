@@ -13,8 +13,8 @@ Each phase has its own spec file. Phases are independently testable and ship in 
 | 4 | Executor | Done | [completed/phase-4.md](completed/phase-4.md) |
 | 5 | Runner + Observability | Done | [completed/phase-5.md](completed/phase-5.md) |
 | — | Blackboard Lifecycle Fix | Done | [completed/lifecycle-fix.md](completed/lifecycle-fix.md) |
-| 6 | Signal Bus + Runner Rewrite | Next | [phase-6-signal-bus.md](phase-6-signal-bus.md) |
-| 7 | DefenseClaw | Blocked on 6 | [phase-7-defense-claw.md](phase-7-defense-claw.md) |
+| 6 | Signal Bus + Runner Rewrite | Done | [completed/phase-6.md](completed/phase-6.md) |
+| 7 | DefenseClaw | Done | [completed/phase-7-defense-claw.md](completed/phase-7-defense-claw.md) |
 | 8 | Agent Loop (Reactive Gaps) | Ready | [phase-8-agent-loop.md](phase-8-agent-loop.md) |
 | 9 | Memory M1 | Planned | [phase-9-memory-m1.md](phase-9-memory-m1.md) |
 | 10 | Memory M2 + M3 | Planned | [phase-10-memory-m2-m3.md](phase-10-memory-m2-m3.md) |
