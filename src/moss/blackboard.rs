@@ -7,7 +7,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::MossError;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 
 use super::signal;
 
@@ -110,7 +110,7 @@ pub(crate) struct Blackboard {
     gaps: DashMap<Uuid, Gap>,
     name_index: DashMap<Box<str>, Uuid>,
     evidences: DashMap<Uuid, Vec<Evidence>>,
-    gates: DashMap<Uuid, Value>,
+    pending_approvals: DashMap<Uuid, oneshot::Sender<bool>>,
     tx: broadcast::Sender<signal::Payload>,
 }
 
@@ -119,7 +119,6 @@ pub(crate) struct BlackboardSnapshot {
     intent: Option<Box<str>>,
     gaps: HashMap<Uuid, Gap>,
     evidences: HashMap<Uuid, Vec<Evidence>>,
-    gates: HashMap<Uuid, Value>,
 }
 
 impl Blackboard {
@@ -129,9 +128,13 @@ impl Blackboard {
             gaps: DashMap::new(),
             name_index: DashMap::new(),
             evidences: DashMap::new(),
-            gates: DashMap::new(),
+            pending_approvals: DashMap::new(),
             tx,
         }
+    }
+
+    pub(crate) fn signal_tx(&self) -> &broadcast::Sender<signal::Payload> {
+        &self.tx
     }
 
     pub(crate) fn set_intent(&self, intent: impl Into<Box<str>>) {
@@ -234,9 +237,14 @@ impl Blackboard {
         self.gaps.iter().all(|g| g.state == GapState::Closed)
     }
 
-    pub(crate) fn insert_gate(&self, gap_id: Uuid, payload: Value) {
-        self.gates.insert(gap_id, payload);
-        let _  = self.tx.send(self.snapshot_json());
+    pub(crate) fn register_approval(&self, gap_id: Uuid, sender: oneshot::Sender<bool>) {
+        self.pending_approvals.insert(gap_id, sender);
+    }
+
+    pub(crate) fn approve(&self, gap_id: Uuid, approved: bool) {
+        if let Some((_, sender)) = self.pending_approvals.remove(&gap_id) {
+            let _ = sender.send(approved);
+        }
     }
 
     pub(crate) fn all_evidence(&self) -> Vec<Evidence> {
@@ -251,12 +259,12 @@ impl Blackboard {
             intent: self.intent.lock().unwrap().clone(),
             gaps: self.gaps.iter().map(|e| (*e.key(), e.value().clone())).collect(),
             evidences: self.evidences.iter().map(|e| (*e.key(), e.value().clone())).collect(),
-            gates: self.gates.iter().map(|e| (*e.key(), e.value().clone())).collect(),
         }
     }
 
-    fn snapshot_json(&self) -> Box<str> {
-        serde_json::to_string(&self.snapshot()).unwrap_or_default().into()
+    fn snapshot_json(&self) -> super::signal::Event {
+        let json: Box<str> = serde_json::to_string(&self.snapshot()).unwrap_or_default().into();
+        super::signal::Event::Snapshot(json)
     }
 }
 

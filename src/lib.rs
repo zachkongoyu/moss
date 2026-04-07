@@ -6,6 +6,7 @@ pub mod providers;
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 use error::MossError;
 use moss::orchestrator::Orchestrator;
@@ -28,6 +29,10 @@ impl Moss {
 
     pub fn subscribe(&self) -> broadcast::Receiver<moss::signal::Payload> {
         self.tx.subscribe()
+    }
+
+    pub fn approve(&self, gap_id: Uuid, approved: bool) {
+        self.orchestrator.approve(gap_id, approved);
     }
 
     pub async fn run(&self, query: &str) -> Result<String, MossError> {

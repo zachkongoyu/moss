@@ -2,8 +2,8 @@ use tokio::io::AsyncBufReadExt;
 use tokio::sync::broadcast;
 
 use crate::error::MossError;
+use crate::moss::signal::{self, Event};
 use crate::Moss;
-use crate::moss::signal;
 
 pub struct Cli {
     moss: Moss,
@@ -45,8 +45,24 @@ impl Cli {
                             }
                             break;
                         }
-                        signal = self.rx.recv() => match signal {
-                            Ok(snapshot) => tracing::debug!(snapshot = %snapshot, "board updated"),
+                        event = self.rx.recv() => match event {
+                            Ok(Event::Snapshot(json)) => {
+                                tracing::debug!(snapshot = %json, "board updated");
+                            }
+                            Ok(Event::ApprovalRequested { gap_id, gap_name, reason }) => {
+                                eprintln!("\n[guard] gap `{gap_name}` requires approval");
+                                eprintln!("       reason: {reason}");
+                                eprint!("       approve? [y/N] ");
+
+                                let mut line = String::new();
+                                tokio::io::AsyncBufReadExt::read_line(
+                                    &mut tokio::io::BufReader::new(tokio::io::stdin()),
+                                    &mut line,
+                                ).await?;
+
+                                let approved = line.trim().eq_ignore_ascii_case("y");
+                                self.moss.approve(gap_id, approved);
+                            }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
                                 tracing::warn!(skipped = n, "signal bus lagged");
                             }
