@@ -44,12 +44,13 @@ L0  Infrastructure     LLM providers, MCP bridge, DefenseClaw scanner
 ### Layer responsibilities
 
 **L5 — Interface** `PARTIAL`
-The user-facing surface. Currently a minimal async CLI (`tokio::io::BufReader` over stdin). The planned HUD component will stream Blackboard deltas (Gap state transitions, Evidence arrivals) to the terminal in real time.
+The user-facing surface. Currently a minimal async CLI inlined in `main.rs`. Phase 6c extracts this into a dedicated `Cli` module (`src/cli.rs`) with a `tokio::select!` event loop over stdin + `SignalBus`. The planned HUD component subscribes to the same `SignalBus` for real-time delta streaming.
 
 | Sub-component | Status | Notes |
 |---|---|---|
-| CLI input loop | `IMPLEMENTED` | `main.rs` — reads lines, passes to `Moss::run`, prints response. |
-| HUD delta streamer | `PLANNED` | Requires Blackboard change notification (see Section 5.2) |
+| CLI input loop | `IMPLEMENTED` | `main.rs` — reads lines, passes to `Moss::run`, prints response. To be extracted into `src/cli.rs` (Phase 6c). |
+| CLI signal handling | `PLANNED` | `Cli` struct subscribes to `SignalBus`. Renders `GateRequested`, `System` signals. Handles `approve`/`reject` commands. |
+| HUD delta streamer | `PLANNED` | Another `SignalBus` consumer. Phase 11. |
 
 **L4 — Orchestrator** `PARTIAL`
 The strategic coordinator. Receives user input and the full Blackboard state (intent + Gaps + Evidence), decomposes the query into new Gaps, and refines the intent on follow-ups. Hands the plan to the **Runner** (L2) to drive execution. When all Gaps are Closed, synthesizes the final response from all Evidence using the latest intent.
@@ -68,8 +69,8 @@ Living workspace using `DashMap` for lock-free concurrent access. Holds the inte
 |---|---|---|
 | Data structures (Gap, Evidence, Blackboard) | `IMPLEMENTED` | `blackboard.rs` — `GapState`, `GapType`, `Gap`, `EvidenceStatus`, `Evidence`, `Blackboard` with private fields and `pub(crate)` getters |
 | Insert/mutate operations | `IMPLEMENTED` | `insert_gap`, `set_gap_state`, `append_evidence`, `insert_gate`, `set_intent` |
-| Dependency resolution (auto-unblock) | `IMPLEMENTED` | `promote_unblocked`, `drain_ready`, `all_closed`, `all_gated_or_closed` — unit tested |
-| Change notification (for HUD) | `PLANNED` | `tokio::broadcast` or watch channel |
+| Dependency resolution (auto-unblock) | `IMPLEMENTED` | `promote_unblocked`, `drain_ready`, `all_closed` — unit tested. `all_gated_or_closed` to be removed (ADR-007). |
+| Signal Bus integration | `PLANNED` | Blackboard mutations emit `Signal` events via system-wide `SignalBus` (see ADR-008). `insert_gate()` emits `GateRequested` and returns per-gate `oneshot::Receiver<bool>`. |
 
 **L2 — Compiler, Executor & Runner** `PARTIAL`
 The Compiler takes a Gap description and emits an executable artifact. The Executor runs it and posts Evidence back to the Blackboard. The Runner drives the full execution loop.
@@ -145,25 +146,30 @@ User input
     promote_unblocked()
                     |
                     v
-[6] EXECUTION LOOP (Runner — runs until all *new* Gaps are Closed):
+[6] EXECUTION LOOP (Runner — persistent JoinSet, one completion per iteration):
     |
-    |   6a. Poll Blackboard for all Ready Gaps (drain_ready)
-    |   6b. For each Ready Gap, spawn into tokio::JoinSet:
-    |       6b-i.   Mark Gap as Assigned
-    |       6b-ii.  Send Gap to Compiler (LLM call)
-    |       6b-iii. Compiler returns artifact (Script or AgentSpec)
-    |       6b-iv.  DefenseClaw scans artifact
-    |       6b-v.   If high-risk: Gap → Gated, post Gate, skip execution
-    |       6b-vi.  Executor runs artifact
-    |       6b-vii. Executor posts Evidence to Blackboard
-    |       6b-viii. Gap → Closed
-    |   6c. After each JoinSet completion:
-    |       - promote_unblocked() — check Blocked Gaps
-    |       - Terminal check:
-    |           all Gaps Closed                  → done
-    |           all remaining Gaps Gated/Closed  → yield to user (print Gates)
-    |           else deadlock
-    |   6d. If terminal: break
+    |   6a. promote_unblocked() — check Blocked Gaps
+    |   6b. drain_ready() — poll Blackboard for all Ready Gaps
+    |   6c. For each Ready Gap, spawn into tokio::JoinSet:
+    |       6c-i.    Mark Gap as Assigned
+    |       6c-ii.   Send Gap to Compiler (LLM call)
+    |       6c-iii.  Compiler returns artifact (Script or AgentSpec)
+    |       6c-iv.   DefenseClaw scans artifact
+    |       6c-v.    If Gated: Gap → Gated, insert Gate (fires broadcast to CLI),
+    |                await human response on oneshot channel (this is just I/O —
+    |                the task stays on the JoinSet like any other async wait)
+    |       6c-vi.   If Rejected: post Failure evidence, Gap → Closed, return
+    |       6c-vii.  Executor runs artifact
+    |       6c-viii.  Executor posts Evidence to Blackboard
+    |       6c-ix.   Gap → Closed
+    |   6d. If JoinSet is empty:
+    |       - all Gaps Closed → done
+    |       - else → deadlock
+    |   6e. Wait for ONE task to complete (join_next), then loop back to 6a
+    |
+    |   Note: Gated gaps stay alive on the JoinSet awaiting human I/O.
+    |   Other gaps complete, promote dependents, and get dispatched
+    |   without waiting for the human. The Runner has no gate-specific logic.
     |
     v
 [7] Orchestrator.synthesize() — reads latest intent + all Evidence
@@ -268,7 +274,7 @@ For the first message in a session (no board exists), this is `{}`.
 
 **Responsibility:** Living workspace for the current conversation thread. Holds the intent (mutable), the Gap DAG (append-only), Evidence map, and HITL Gates. A Blackboard stays open across follow-up messages — the Orchestrator inserts new Gaps and updates the intent on each decompose call. It is sealed only when the topic changes or the session ends (see Section 10).
 
-**Current state:** Core data structures, insert/mutate operations, dependency resolution, and ready-gap polling are implemented and unit tested. Pending: `to_planner_view()` method for rich serialization to the Orchestrator, change notification for HUD streaming.
+**Current state:** Core data structures, insert/mutate operations, dependency resolution, and ready-gap polling are implemented and unit tested. Pending: `to_planner_view()` method for rich serialization to the Orchestrator, `SignalBus` integration for event emission (see ADR-008).
 
 **Implemented interface:**
 
@@ -280,11 +286,8 @@ impl Blackboard {
     /// For every Blocked gap whose dependencies are all Closed, promote to Ready.
     pub(crate) fn promote_unblocked(&self);
 
-    /// True when every gap is in Closed state.
+    /// True when every gap is in Closed state. This is the Runner's only terminal condition.
     pub(crate) fn all_closed(&self) -> bool;
-
-    /// True when every gap is in Closed or Gated state.
-    pub(crate) fn all_gated_or_closed(&self) -> bool;
 
     /// Retrieve a gap by ID (cloned for send across await).
     pub(crate) fn get_gap(&self, id: &Uuid) -> Option<Gap>;
@@ -292,10 +295,17 @@ impl Blackboard {
     /// Retrieve a gap UUID by name slug. Used by promote_unblocked and dependency resolution.
     pub fn get_gap_id_by_name(&self, name: &str) -> Option<Uuid> { ... }
 
-    /// Subscribe to state changes (for HUD streaming).
-    pub fn subscribe(&self) -> broadcast::Receiver<BlackboardDelta> { ... }
+    /// Insert a HITL gate. Emits Signal::GateRequested via SignalBus.
+    /// Returns a oneshot::Receiver<bool> that the gap task awaits for the human response.
+    pub(crate) fn insert_gate(&self, gap_id: Uuid, reason: impl Into<Box<str>>) -> oneshot::Receiver<bool>;
 }
 ```
+
+All Blackboard mutation methods (`set_gap_state`, `insert_gap`, `append_evidence`, `set_intent`, `insert_gate`) emit `Signal` events via the system-wide `SignalBus` (see ADR-008). Consumers (CLI, HUD, logger) subscribe to the bus independently — the Blackboard doesn't know or care who's listening.
+
+**Removed:** `all_gated_or_closed()` — no longer needed. The Runner's terminal condition is `all_closed()`. Gated gaps stay alive on the JoinSet as async I/O waits; the Runner has no gate-specific logic (see ADR-005, ADR-007).
+
+**Removed:** `subscribe()` from Blackboard — subscription is now on the system-level `SignalBus`, not on the Blackboard. See `Moss::subscribe()` (ADR-008).
 
 **Name→UUID reverse index:**
 `Gap.dependencies` stores names (`Vec<Box<str>>`), but the gap map is keyed by `Uuid`. A secondary index `name_index: DashMap<Box<str>, Uuid>` is populated atomically in `insert_gap` alongside the primary map. This makes `promote_unblocked` O(D) per gap (D = dependency count) instead of O(N·D) with a scan. The index is append-only — gap names are immutable after insertion.
@@ -697,7 +707,7 @@ Created ──> Active ──> Idle ──> Active  (follow-up adds new Gaps)
 
 **Active → Idle:** `blackboard.all_closed()` returns `true`. The Runner exits. Synthesis runs and the response is returned to the user. The Blackboard stays in memory, holding all Gaps and Evidence, waiting for the next message.
 
-**Active → Active (HITL loop):** When `blackboard.all_gated_or_closed()` is `true` but `all_closed()` is `false`, the Blackboard stays Active. Moss surfaces pending Gates to the user, waits for `approve <name>` / `reject <name>`, updates the affected Gaps, and resumes the Runner.
+**Active → Active (HITL):** When one or more gaps are Gated, those gap tasks are still alive on the Runner's JoinSet, awaiting human I/O. The Blackboard stays Active. The CLI receives `GateCreated` deltas via broadcast and surfaces them in real-time. The user runs `approve <name>` / `reject <name>`, which sends on the gate's `oneshot` channel. The gap task resumes (or closes), the Runner loop picks up the completion, promotes dependents, and continues. No special HITL loop — this is just normal async I/O within the execution loop.
 
 **Idle → Active (follow-up):** A new user message arrives. MossKernel calls `orchestrator.decompose()` with the new query and the full Blackboard state (all existing Gaps, Evidence, and current intent). The Orchestrator returns an updated intent and new Gaps. MossKernel updates the intent, inserts the new Gaps, and kicks off the Runner again. New Gaps may declare dependencies on existing Closed Gaps — those dependencies are already satisfied, so the new Gaps promote to Ready immediately.
 
@@ -830,8 +840,8 @@ This is a one-directional state machine. The only backward arc is `Gated → Rea
 |---|---|---|
 | **Blocked** | Gap has dependencies that are not yet Closed | All dependencies reach Closed state; auto-promoted to Ready by `promote_unblocked()` |
 | **Ready** | No unresolved dependencies; eligible for scheduling | Picked up by the Runner and marked Assigned |
-| **Assigned** | Compiler has been invoked; Executor is running | Executor posts Evidence and marks the gap Closed, OR DefenseClaw flags high-risk → Gated |
-| **Gated** | DefenseClaw detected a high-risk action requiring user approval | User runs `approve <name>` → back to Ready; user runs `reject <name>` → Closed with terminal failure |
+| **Assigned** | Compiler has been invoked; Executor is running | Executor posts Evidence and marks the gap Closed, OR any component gates the gap → Gated |
+| **Gated** | Gap needs human action (security approval, user input, judgment call, physical action). The gap task stays alive on the JoinSet awaiting a `oneshot` response — this is just async I/O. The Runner has no gate-specific logic. | User runs `approve <name>` → task resumes execution; user runs `reject <name>` → Closed with terminal failure |
 | **Closed** | Terminal. The gap is resolved (success, terminal failure, or user rejection) | — |
 
 **Gaps with no dependencies** skip Blocked and are inserted directly as Ready.
@@ -934,15 +944,15 @@ pub enum MossError {
 
 ### ADR-005: Human-in-the-Loop via `GapState::Gated`
 
-**Status:** Accepted
+**Status:** Accepted — updated by ADR-007 (HITL gating as I/O).
 
-**Context:** Some Gap artifacts generated by the Compiler represent high-risk actions (deleting files, sending email, making purchases). Executing these without user confirmation is unsafe. The architecture needs a pause mechanism.
+**Context:** Some Gap actions require human involvement before they can proceed. This includes security-sensitive actions (deleting files, sending email, making purchases) flagged by DefenseClaw, but also any situation where the system needs human input, judgment, or physical action (entering a 2FA code, choosing between options, confirming a preference).
 
-**Decision:** When DefenseClaw flags a high-risk artifact, the Gap transitions to `Gated` state. The Runner's execution loop skips Gated Gaps. The CLI surfaces all pending Gates. The user runs `approve <name>` to allow execution (Gap transitions back to Ready) or `reject <name>` to abort it (Gap transitions to Closed with `EvidenceStatus::Failure`).
+**Decision:** When any component determines a Gap needs human action, the Gap transitions to `Gated` state and a Gate is inserted into the Blackboard (which emits `Signal::GateRequested` via the `SignalBus` — see ADR-008). The gap task **stays alive on the JoinSet**, awaiting the human response on a per-gate `oneshot` channel — this is just I/O, no different from awaiting a web request. The Runner has no gate-specific logic; it processes one JoinSet completion per iteration and loops. Other gaps keep executing concurrently while the human acts. The CLI subscribes to the `SignalBus` and surfaces Gate prompts in real-time. The user runs `approve <name>` or `reject <name>`, which sends on the gate's `oneshot`. On approval, the gap task resumes execution. On rejection, the Gap posts Failure evidence and transitions to Closed.
 
-**Rationale:** `Gated` is a first-class state in the Gap lifecycle — not an error, not a special case. The execution loop already handles "skip non-Ready gaps" semantics for Blocked gaps; Gated reuses the same pattern. The Gate is stored on the Blackboard, making it observable by the HUD. No background timer or side channel is needed.
+**Rationale:** `Gated` is a first-class state for **observability** (HUD, planner view, CLI display). The Runner doesn't check for it — it just sees async tasks on the JoinSet. Human latency doesn't block unrelated gaps because the JoinSet processes completions incrementally (one at a time), not in batch. The terminal condition is simply `all_closed()` — `all_gated_or_closed()` is removed.
 
-**Trade-offs:** A Gated Gap blocks all downstream Gaps that depend on it, since they cannot promote from Blocked until their dependency is Closed. This is correct behaviour — downstream tasks that depend on a human-gated action cannot proceed until that action is confirmed.
+**Trade-offs:** A Gated Gap blocks all downstream Gaps that depend on it, since they cannot promote from Blocked until their dependency is Closed. This is correct — downstream tasks that depend on a human-gated action cannot proceed until that action is confirmed. Independent branches are unaffected.
 
 ### ADR-006: Living Blackboard with Mutable Intent and Growable DAG
 
@@ -992,8 +1002,8 @@ These are unresolved design decisions that need answers before or during impleme
 | Orchestrator execution loop | L4 | `PLANNED` | Runner not yet wired |
 | Blackboard data structures | L3 | `IMPLEMENTED` | All types, private fields, `pub(crate)` getters |
 | Blackboard insert/mutate | L3 | `IMPLEMENTED` | `insert_gap`, `set_gap_state`, `append_evidence`, `insert_gate`, `set_intent` |
-| Blackboard dependency resolution | L3 | `IMPLEMENTED` | `promote_unblocked`, `drain_ready`, `all_closed`, `all_gated_or_closed` — unit tested |
-| Blackboard change notifications | L3 | `PLANNED` | `tokio::broadcast` for HUD |
+| Blackboard dependency resolution | L3 | `IMPLEMENTED` | `promote_unblocked`, `drain_ready`, `all_closed` — unit tested. `all_gated_or_closed` removed (see ADR-007). |
+| Signal Bus integration | L3 | `PLANNED` | Blackboard mutations emit `Signal` events via `SignalBus` (ADR-008). `insert_gate()` returns `oneshot::Receiver<bool>`. |
 | Compiler | L2 | `PLANNED` | — |
 | Executor (script) | L2 | `PLANNED` | — |
 | Executor (Micro-Agent) | L2 | `PLANNED` | Requires MCP bridge and Provider tool-calling |
@@ -1015,9 +1025,9 @@ These are unresolved design decisions that need answers before or during impleme
 3. ~~**Orchestrator decompose + synthesize.**~~ ✅ Done — `minijinja` templates, LLM call, JSON parse, gap insertion in `Moss::run`.
 4. **Compiler.** Load `prompts/compiler.md`, call Provider, parse response into `Artifact`. Testable with LocalMock.
 5. **Executor (script path).** Subprocess runner with timeout. Testable with hand-written Python scripts.
-6. **Runner (execution loop).** Wire Orchestrator → Blackboard → Compiler → Executor → Evidence. First real end-to-end test.
-7. **DefenseClaw.** Static scan pipeline. Middleware slot in the execution loop between Compiler and Executor.
-8. **MCP bridge.** Connect to at least one MCP server (filesystem). Enables real-world test scenarios.
+6. **Signal Bus + Runner rewrite + CLI async loop (ADR-008).** (a) Create `signal.rs`: `Signal` enum + `SignalBus` struct — generic broadcast foundation for Moss. Thread through `Moss` → `Orchestrator` → `Blackboard`. Blackboard mutations auto-emit signals. (b) Rewrite Runner: persistent JoinSet, one-completion-per-iteration loop, terminal condition `all_closed()`, remove `all_gated_or_closed()`. Wire Orchestrator → Blackboard → Compiler → Executor → Evidence. (c) CLI `tokio::select!` over stdin + `Signal` receiver. Show gate prompts on `GateRequested`. Handle `approve`/`reject` → send on oneshot. Prerequisite for DefenseClaw and all HITL gating. See ADR-007, ADR-008.
+7. **DefenseClaw.** Four-stage scan pipeline. Wired into per-gap task between Compiler and Executor. On Gated verdict: set state, insert gate, await oneshot (human I/O). On Rejected: post failure, close.
+8. **MCP bridge + Agent Loop.** Connect to at least one MCP server (filesystem). Implement `MicroAgent` ReAct loop for Reactive Gaps. MicroAgent can gate via `insert_gate()` for human input mid-loop.
 9. **Memory (M1).** Session context layer. Enables cross-board awareness after topic changes.
 10. **Memory (M2/M3).** Sled + Qdrant. Enables cross-session learning.
-11. **HUD.** Blackboard change notifications + delta streaming. Polish layer.
+11. **HUD.** Subscribes to `SignalBus` from phase 6. Renders `Signal` events as terminal deltas. No new infrastructure — just another consumer.
