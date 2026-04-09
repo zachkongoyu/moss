@@ -1,6 +1,6 @@
 # Moss — AI Operating System
 
-Moss is a local-first AI Operating System built in Rust. It transforms a single user intent into a parallel execution plan — a DAG of atomic tasks called Gaps — runs each one by generating and executing code, and synthesizes a final result.
+Moss is a local-first AI Operating System built in Rust. It transforms a single user intent into a parallel execution plan — a DAG of atomic tasks called Gaps — runs each one through a unified Solver loop (generate code, execute, observe, iterate), and synthesizes a final result.
 
 The architecture follows the Blackboard pattern (Hearsay-II lineage): independent specialist components read from and write to shared, structured session memory, coordinated by a central Orchestrator.
 
@@ -9,8 +9,8 @@ The architecture follows the Blackboard pattern (Hearsay-II lineage): independen
 ## Core Ideas
 
 - **Living Blackboard.** A Blackboard stays open across follow-up messages. The Orchestrator appends new Gaps and refines the intent as the conversation evolves. A new Blackboard is created only when the topic changes or the session ends.
-- **Code as the universal solver.** Every Gap is resolved by generating and running code — a deterministic script or a reactive agent loop — not by prompting the LLM to "think harder."
-- **Failure containment.** A failing task cannot corrupt the global state. Reactive tasks run inside encapsulated Micro-Agent instances with an isolated ReAct loop.
+- **Code as the universal solver.** Every Gap is resolved by a unified Solver that generates and runs code in a fixed-frame/mutable-memory loop — not by prompting the LLM to "think harder."
+- **Failure containment.** A failing task cannot corrupt the global state. Each Solver runs in isolation with its own working memory and scratch pad.
 - **Concurrency by default.** Independent Gaps execute in parallel via `tokio::JoinSet`. The DAG structure determines ordering.
 
 ## Quick Start
@@ -43,17 +43,18 @@ Set `RUST_LOG=moss=debug` (or `info` / `trace`) for pipeline logging.
 src/
   main.rs                       Entry point, CLI loop
   lib.rs                        Moss facade — public entry point
+  cli.rs                        Interactive CLI
   error.rs                      MossError + ProviderError
   moss/
     blackboard.rs               Living workspace: Gaps, Evidence, Gates, intent
-    orchestrator.rs             Decompose (intent → Gap DAG) + synthesize
-    compiler.rs                 Gap → Artifact (Script or Agent)
-    executor.rs                 Runs Artifacts, writes Evidence to Blackboard
-    runner.rs                   JoinSet execution loop, retry, deadlock detection
+    orchestrator.rs             Decompose → drive Gaps → synthesize
+    solver.rs                   Unified solver loop (Code / Ask / Done)
+    artifact_guard.rs           Pre-execution security scanner (DefenseClaw)
     decomposition.rs            Decomposition DTO (LLM output)
+    signal.rs                   Broadcast event bus
     prompts/
       decompose.md              Planning prompt template
-      compiler.md               Code generation prompt template
+      solver.md                 Solver prompt template (fixed frame)
       synthesize.md             Synthesis prompt template
   providers/
     mod.rs                      Provider trait definition
@@ -92,4 +93,4 @@ These are the target capabilities, ordered by complexity:
 
 ## License
 
-TBD
+Copyright 2026 Ko Ngo Yu. Licensed under the [Apache License 2.0](./LICENSE).

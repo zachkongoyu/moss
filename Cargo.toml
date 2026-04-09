@@ -2,7 +2,9 @@
 name = "moss"
 version = "0.1.0"
 edition = "2024"
-description = "A decentralized, parallel-thinking organism framework."
+license = "Apache-2.0"
+authors = ["Ko Ngo Yu"]
+description = "A local-first AI Operating System built on the Blackboard pattern."
 
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
