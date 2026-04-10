@@ -63,6 +63,19 @@ impl Cli {
                                 let approved = line.trim().eq_ignore_ascii_case("y");
                                 self.moss.approve(gap_id, approved);
                             }
+                            Ok(Event::QuestionAsked { gap_id, gap_name, question }) => {
+                                eprintln!("\n[guard] gap `{gap_name}` requires an answer");
+                                eprintln!("       question: {question}");
+                                eprint!("       answer: ");
+
+                                let mut line = String::new();
+                                tokio::io::AsyncBufReadExt::read_line(
+                                    &mut tokio::io::BufReader::new(tokio::io::stdin()),
+                                    &mut line,
+                                ).await?;
+
+                                self.moss.answer(gap_id, line.trim().to_string());
+                            }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
                                 tracing::warn!(skipped = n, "signal bus lagged");
                             }

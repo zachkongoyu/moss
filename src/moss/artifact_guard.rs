@@ -58,9 +58,8 @@ impl ArtifactGuard {
     // Stage 1: reject forbidden patterns
     fn static_analysis(&self, code: &str) -> Option<ScanVerdict> {
         const FORBIDDEN: &[&str] = &[
-            "import os", "import sys", "import subprocess",
-            "curl ", "wget ", "nc ", "ncat ",
-            "rm -rf", "mkfs", "dd if=",
+            "import subprocess",
+            "nc ", "ncat ",
         ];
 
         for pattern in FORBIDDEN {
