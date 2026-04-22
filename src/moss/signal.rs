@@ -7,6 +7,9 @@ use super::types::{BlackboardSnapshot, Evidence, Gap};
 
 #[derive(Debug)]
 pub enum Event {
+    OrchestratorProgress {
+        phase: Box<str>,
+    },
     BlackboardSnapshot {
         intent:    Option<Box<str>>,
         gaps:      HashMap<Uuid, Gap>,

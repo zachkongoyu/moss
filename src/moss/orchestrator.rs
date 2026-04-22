@@ -78,6 +78,7 @@ impl Orchestrator {
 
     /// Run a single user query end-to-end.
     pub(crate) async fn run(&self, query: &str) -> Result<String, MossError> {
+        let _ = self.tx.try_send(signal::Event::OrchestratorProgress { phase: "decomposing".into() });
         let board = self.blackboard.lock().unwrap().clone();
 
         let decomposition = self.decompose(query, &board).await?;
@@ -107,9 +108,13 @@ impl Orchestrator {
             board.insert_gap(gap)?;
         }
 
+        let _ = self.tx.try_send(signal::Event::OrchestratorProgress { phase: "solving gaps".into() });
         self.drive_gaps(Arc::clone(&board)).await?;
 
-        self.synthesize(&board).await
+        let _ = self.tx.try_send(signal::Event::OrchestratorProgress { phase: "synthesizing response".into() });
+        let response = self.synthesize(&board).await?;
+        let _ = self.tx.try_send(signal::Event::OrchestratorProgress { phase: "complete".into() });
+        Ok(response)
     }
 
     /// Drive the Gap DAG to completion: dispatch ready gaps to the Solver.

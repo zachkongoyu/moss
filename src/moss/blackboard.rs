@@ -105,6 +105,7 @@ impl Blackboard {
                 g.state = GapState::Ready;
             }
         }
+        let _ = self.tx.try_send(self.snapshot().into());
     }
 
     /// Take all `Ready` gaps, mark them `Assigned`, and return them.
@@ -124,6 +125,9 @@ impl Blackboard {
                     taken.push(g.clone());
                 }
             }
+        }
+        if !taken.is_empty() {
+            let _ = self.tx.try_send(self.snapshot().into());
         }
         taken
     }

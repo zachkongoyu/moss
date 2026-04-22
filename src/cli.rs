@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 
 use crossterm::{
-    event::{self, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     style::{Attribute, SetAttribute, SetForegroundColor, Color as CtColor, ResetColor},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -42,29 +42,40 @@ struct ProgressEntry {
 
 struct UiState {
     query:          String,
+    phase:          String,
     snapshot:       Option<BlackboardSnapshot>,
     gap_order:      Vec<String>,
     progress:       HashMap<String, ProgressEntry>,
     evidence_count: usize,
     attention:      Option<Attention>,
     input_buf:      String,
+    frame:          u32,
 }
 
 impl UiState {
     fn new(query: String) -> Self {
         Self {
             query,
+            phase:          "starting".to_string(),
             snapshot:       None,
             gap_order:      Vec::new(),
             progress:       HashMap::new(),
             evidence_count: 0,
             attention:      None,
             input_buf:      String::new(),
+            frame:          0,
         }
+    }
+
+    fn tick_frame(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
     }
 
     fn apply(&mut self, ev: Event) {
         match ev {
+            Event::OrchestratorProgress { phase } => {
+                self.phase = phase.to_string();
+            }
             Event::BlackboardSnapshot { intent, gaps, evidences } => {
                 let snap = BlackboardSnapshot::new(intent, gaps, evidences);
                 for gap in snap.gaps() {
@@ -77,7 +88,12 @@ impl UiState {
                 self.snapshot = Some(snap);
             }
             Event::SolverProgress { gap_name, iteration, max_iterations, step, last_result, .. } => {
-                self.progress.insert(gap_name.to_string(), ProgressEntry {
+                self.phase = "solving gaps".to_string();
+                let gap_name = gap_name.to_string();
+                if !self.gap_order.contains(&gap_name) {
+                    self.gap_order.push(gap_name.clone());
+                }
+                self.progress.insert(gap_name, ProgressEntry {
                     iteration, max_iterations, step, last_result,
                 });
             }
@@ -102,6 +118,7 @@ impl UiState {
 
     fn handle_key(&mut self, key: KeyEvent) {
         if self.attention.is_none() { return; }
+        if matches!(key.kind, KeyEventKind::Release) { return; }
         match key.code {
             KeyCode::Backspace => { self.input_buf.pop(); }
             KeyCode::Char(c)   => { self.input_buf.push(c); }
@@ -260,6 +277,7 @@ impl Cli {
 
                 tokio::pin!(let fut = self.moss.run(query););
                 let result = loop {
+                    self.state.tick_frame();
                     terminal.draw(|f| render(f, &self.state))?;
                     tokio::select! {
                         r    = &mut fut        => break r,
@@ -277,6 +295,9 @@ impl Cli {
                                 self.state.handle_key(key);
                             }
                         }
+                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(50)) => {
+                            // Keep frame animating even when no events arrive
+                        }
                     }
                 };
 
@@ -284,6 +305,7 @@ impl Cli {
                 while let Ok(ev) = self.rx.try_recv() {
                     self.state.apply(ev);
                 }
+                self.state.tick_frame();
                 terminal.draw(|f| render_with_footer(f, &self.state, " Press Enter to continue... "))?;
 
                 // Wait for any key before leaving
@@ -355,6 +377,23 @@ fn render_with_footer(frame: &mut Frame, state: &UiState, footer: &str) {
     frame.render_widget(Paragraph::new(build_lines(state, w, Some(footer))), frame.area());
 }
 
+fn spinner_frame(frame_counter: u32) -> &'static str {
+    const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    FRAMES[(frame_counter as usize) % FRAMES.len()]
+}
+
+fn phase_display(phase: &str, frame: u32) -> String {
+    if phase_is_complete(phase) {
+        format!("✓ {phase}")
+    } else {
+        format!("{} {phase}", spinner_frame(frame))
+    }
+}
+
+fn phase_is_complete(phase: &str) -> bool {
+    phase.eq_ignore_ascii_case("complete") || phase.eq_ignore_ascii_case("completed")
+}
+
 // ── Color palette (Claude Code inspired) ──────────────────────────────────────
 
 const CLR_BORDER:   Color = Color::Rgb(88, 88, 88);    // dim gray
@@ -377,6 +416,9 @@ fn build_lines(state: &UiState, w: usize, footer: Option<&str>) -> Vec<Line<'sta
     // Blackboard summary
     let snap = state.snapshot.as_ref();
     let intent = snap.and_then(|s| s.intent()).unwrap_or("(pending)");
+    let phase = phase_display(&state.phase, state.frame);
+    lines.push(styled_row_phase(w, &phase, phase_is_complete(&state.phase)));
+    lines.push(styled_box_row_empty(w));
     lines.push(styled_row_kv(w, "intent", intent));
     lines.push(styled_row_kv(w, "gaps", &format!("{} total", state.gap_order.len())));
 
@@ -403,7 +445,7 @@ fn build_lines(state: &UiState, w: usize, footer: Option<&str>) -> Vec<Line<'sta
         lines.push(styled_row_dim(w, "(waiting for gaps\u{2026})"));
     } else {
         for chunk in state.gap_order.chunks(per_row) {
-            for row in card_chunk_lines(chunk, snap, &state.progress, inner_w) {
+            for row in card_chunk_lines(chunk, snap, &state.progress, inner_w, state.frame) {
                 lines.push(row);
             }
             lines.push(styled_box_row_empty(w));
@@ -420,7 +462,18 @@ fn build_lines(state: &UiState, w: usize, footer: Option<&str>) -> Vec<Line<'sta
                 lines.push(styled_row_input(w, "approve? [y/N]", &state.input_buf));
             }
             Attention::Question { gap_name, question, .. } => {
-                lines.push(styled_row_warn(w, &format!("{gap_name} asks: {question}")));
+                let inner = w.saturating_sub(2);
+                let prefix = format!(" {gap_name} asks: ");
+                let available = inner.saturating_sub(prefix.len());
+                
+                let wrapped = wrap_text(question, available);
+                for (idx, line_text) in wrapped.iter().enumerate() {
+                    if idx == 0 {
+                        lines.push(styled_row_warn(w, &format!("{gap_name} asks: {line_text}")));
+                    } else {
+                        lines.push(styled_row_warn(w, &format!("  {line_text}")));
+                    }
+                }
                 lines.push(styled_row_input(w, "answer", &state.input_buf));
             }
         }
@@ -439,6 +492,7 @@ fn card_chunk_lines(
     snap:     Option<&BlackboardSnapshot>,
     progress: &HashMap<String, ProgressEntry>,
     inner_w:  usize,
+    frame:    u32,
 ) -> Vec<Line<'static>> {
     let n = names.len();
     let total_cards_w = n * CARD_TOTAL + n.saturating_sub(1);
@@ -454,6 +508,13 @@ fn card_chunk_lines(
         let gap_state = snap.and_then(|s| s.gap_state(name));
         let state_label = gap_state.map(gap_state_label).unwrap_or("-");
         let state_color = gap_state.map(gap_state_color).unwrap_or(CLR_LABEL);
+
+        // Add spinner animation for running and just-completed gaps
+        let status_display = match gap_state {
+            Some(&GapState::Assigned) => format!("{} {}", spinner_frame(frame), state_label),
+            Some(&GapState::Closed) => format!("✓ {}", state_label),
+            _ => state_label.to_string(),
+        };
 
         let prog     = progress.get(name);
         let iter_str = prog.map_or("-".to_string(), |p| format!("{}/{}", p.iteration, p.max_iterations));
@@ -475,10 +536,10 @@ fn card_chunk_lines(
 
         // Rows 1-4: content
         let fields: [(_, _, Color); 4] = [
-            ("status", state_label.to_string(), state_color),
-            ("iter",   iter_str,                CLR_VALUE),
-            ("step",   step_str,                CLR_VALUE),
-            ("last",   last_str,                CLR_LABEL),
+            ("status", status_display, state_color),
+            ("iter",   iter_str,       CLR_VALUE),
+            ("step",   step_str,       CLR_VALUE),
+            ("last",   last_str,       CLR_LABEL),
         ];
         for (r, (lbl, val, clr)) in fields.into_iter().enumerate() {
             row_spans[r + 1].push(Span::raw(spacer.clone()));
@@ -567,6 +628,25 @@ fn styled_row_kv(w: usize, key: &str, value: &str) -> Line<'static> {
         Span::styled("│", border),
         Span::styled(prefix, Style::default().fg(CLR_LABEL)),
         Span::styled(pad_truncate(value, val_len), Style::default().fg(CLR_VALUE)),
+        Span::styled("│", border),
+    ])
+}
+
+fn styled_row_phase(w: usize, value: &str, is_complete: bool) -> Line<'static> {
+    let inner = w.saturating_sub(2);
+    let border = Style::default().fg(CLR_BORDER);
+    let label = " phase ▶ ";
+    let value_style = if is_complete {
+        Style::default().fg(CLR_DONE).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(CLR_RUNNING).add_modifier(Modifier::BOLD)
+    };
+
+    let value_len = inner.saturating_sub(label.len());
+    Line::from(vec![
+        Span::styled("│", border),
+        Span::styled(label.to_string(), Style::default().fg(CLR_TITLE).add_modifier(Modifier::BOLD)),
+        Span::styled(pad_truncate(value, value_len), value_style),
         Span::styled("│", border),
     ])
 }
@@ -677,10 +757,177 @@ fn styled_box_bottom_msg(w: usize, msg: &str) -> Line<'static> {
 
 /// Pad with spaces or truncate to exactly `width` terminal columns.
 fn pad_truncate(s: &str, width: usize) -> String {
-    let n = s.chars().count();
+    let normalized: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+
+    let n = normalized.chars().count();
     if n >= width {
-        s.chars().take(width).collect()
+        normalized.chars().take(width).collect()
     } else {
-        format!("{}{}", s, " ".repeat(width - n))
+        format!("{}{}", normalized, " ".repeat(width - n))
+    }
+}
+
+/// Wrap text to fit within a maximum width, breaking on word boundaries.
+fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    if max_width < 1 {
+        return vec![text.to_string()];
+    }
+    
+    let mut lines = Vec::new();
+    let mut current_line = String::new();
+    
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        let current_len = current_line.chars().count();
+        
+        if current_len == 0 {
+            // First word on the line
+            if word_len <= max_width {
+                current_line.push_str(word);
+            } else {
+                // Word is too long, break it up
+                lines.push(word.chars().take(max_width).collect());
+                if word_len > max_width {
+                    current_line = word.chars().skip(max_width).collect();
+                }
+            }
+        } else if current_len + 1 + word_len <= max_width {
+            // Word fits on current line with space
+            current_line.push(' ');
+            current_line.push_str(word);
+        } else {
+            // Start a new line
+            lines.push(current_line);
+            current_line = word.to_string();
+        }
+    }
+    
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+    
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn lines_to_text(lines: Vec<Line<'static>>) -> String {
+        lines
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn ignores_release_events_while_collecting_answer_input() {
+        let (tx, _rx) = oneshot::channel();
+        let mut state = UiState::new("query".to_string());
+        state.attention = Some(Attention::Question {
+            gap_name: "gap".to_string(),
+            question: "question".to_string(),
+            tx,
+        });
+
+        state.handle_key(KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        state.handle_key(KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+
+        assert_eq!(state.input_buf, "a");
+    }
+
+    #[test]
+    fn solver_progress_adds_gap_to_order_when_snapshot_is_missing() {
+        let mut state = UiState::new("query".to_string());
+
+        state.apply(Event::SolverProgress {
+            gap_id: Uuid::new_v4(),
+            gap_name: "parallel_gap".into(),
+            iteration: 1,
+            max_iterations: 10,
+            step: "code: python3".into(),
+            last_result: Some("exit 0".into()),
+        });
+
+        assert_eq!(state.gap_order, vec!["parallel_gap".to_string()]);
+        assert!(state.progress.contains_key("parallel_gap"));
+    }
+
+    #[test]
+    fn pad_truncate_normalizes_newlines_to_keep_single_line_layout() {
+        let formatted = pad_truncate("line1\nline2\tline3", 16);
+        assert!(!formatted.contains('\n'));
+        assert_eq!(formatted.chars().count(), 16);
+    }
+
+    #[test]
+    fn build_lines_includes_phase_row() {
+        let state = UiState::new("query".to_string());
+        let text = lines_to_text(build_lines(&state, 100, None));
+        assert!(text.contains("phase"));
+    }
+
+    #[test]
+    fn build_lines_places_phase_before_intent() {
+        let state = UiState::new("query".to_string());
+        let text = lines_to_text(build_lines(&state, 100, None));
+        let phase_idx = text.find("phase").unwrap_or(usize::MAX);
+        let intent_idx = text.find("intent").unwrap_or(usize::MAX);
+        assert!(phase_idx < intent_idx, "phase should render before intent");
+    }
+
+    #[test]
+    fn build_lines_adds_blank_row_after_phase() {
+        let state = UiState::new("query".to_string());
+        let lines = build_lines(&state, 100, None)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        let phase_idx = lines
+            .iter()
+            .position(|line| line.contains("phase ▶"))
+            .unwrap_or(usize::MAX);
+        assert!(phase_idx < lines.len().saturating_sub(1));
+
+        let next_line = &lines[phase_idx + 1];
+        assert!(!next_line.contains("intent"), "spacer row should be between phase and intent");
+        assert_eq!(next_line.chars().filter(|c| !c.is_whitespace()).collect::<String>(), "││");
+    }
+
+    #[test]
+    fn phase_display_shows_spinner_for_active_phase() {
+        let frame = 3;
+        let display = phase_display("solving gaps", frame);
+        assert_eq!(display, format!("{} solving gaps", spinner_frame(frame)));
+    }
+
+    #[test]
+    fn phase_display_shows_checkmark_for_complete_phase() {
+        assert_eq!(phase_display("complete", 0), "✓ complete");
+        assert_eq!(phase_display("COMPLETED", 0), "✓ COMPLETED");
     }
 }
